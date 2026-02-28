@@ -109,8 +109,10 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  fs.chmodSync(groupSessionsDir, 0o777);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
+    const hostSettings = readEnvFile(['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC']);
     fs.writeFileSync(
       settingsFile,
       JSON.stringify(
@@ -125,6 +127,9 @@ function buildVolumeMounts(
             // Enable Claude's memory feature (persists user preferences between sessions)
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+            // Inherit proxy URL and traffic settings from host Claude Code config
+            ...(hostSettings.ANTHROPIC_BASE_URL && { ANTHROPIC_BASE_URL: hostSettings.ANTHROPIC_BASE_URL }),
+            ...(hostSettings.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC && { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: hostSettings.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC }),
           },
         },
         null,
@@ -204,7 +209,7 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']);
 }
 
 function buildContainerArgs(

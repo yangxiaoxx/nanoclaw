@@ -3,11 +3,16 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  FEISHU_APP_ID,
+  FEISHU_APP_SECRET,
+  FEISHU_VERIFICATION_TOKEN,
+  FEISHU_ONLY,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
+import { FeishuChannel } from './channels/feishu.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -475,9 +480,23 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  if (!FEISHU_ONLY) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
+
+  // Feishu channel
+  if (FEISHU_APP_ID && FEISHU_APP_SECRET && FEISHU_VERIFICATION_TOKEN) {
+    const feishu = new FeishuChannel(
+      FEISHU_APP_ID,
+      FEISHU_APP_SECRET,
+      FEISHU_VERIFICATION_TOKEN,
+      channelOpts,
+    );
+    channels.push(feishu);
+    await feishu.connect();
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
