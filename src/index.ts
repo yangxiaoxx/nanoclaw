@@ -523,8 +523,12 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) =>
-      whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
+    syncGroupMetadata: (force) => {
+      // Each channel may implement its own metadata sync.
+      // WhatsApp has explicit sync; Feishu discovers metadata via events.
+      if (whatsapp) return whatsapp.syncGroupMetadata(force);
+      return Promise.resolve();
+    },
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
