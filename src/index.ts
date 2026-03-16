@@ -24,6 +24,7 @@ import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
+import * as db from './db.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -136,8 +137,12 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
+  logger.info({ chatJid }, 'processGroupMessages: Entry');
   const group = registeredGroups[chatJid];
-  if (!group) return true;
+  if (!group) {
+    logger.info({ chatJid }, 'processGroupMessages: Group not found');
+    return true;
+  }
 
   const channel = findChannel(channels, chatJid);
   if (!channel) {
@@ -148,19 +153,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  logger.info({ chatJid, sinceTimestamp }, 'processGroupMessages: Fetching messages since');
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
   );
 
+  logger.info({ chatJid, messageCount: missedMessages.length }, 'processGroupMessages: Got messages');
   if (missedMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // Direct messages (non-group chats) always trigger
+  const isGroupChat = db.isGroupChat(chatJid);
+  logger.info({ chatJid, isMainGroup, isGroupChat, requiresTrigger: group.requiresTrigger }, 'processGroupMessages: Trigger check setup');
+  if (!isMainGroup && isGroupChat && group.requiresTrigger !== false) {
     const hasTrigger = missedMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
+    logger.info({ chatJid, hasTrigger, triggerPattern: TRIGGER_PATTERN.source, firstMessage: missedMessages[0]?.content }, 'processGroupMessages: Trigger check result');
     if (!hasTrigger) return true;
   }
 
@@ -368,7 +379,10 @@ async function startMessageLoop(): Promise<void> {
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
           const group = registeredGroups[chatJid];
-          if (!group) continue;
+          if (!group) {
+            logger.debug({ chatJid }, 'Group not registered, skipping');
+            continue;
+          }
 
           const channel = findChannel(channels, chatJid);
           if (!channel) {
@@ -377,7 +391,10 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          const isGroupChat = chatJid.endsWith('@g.us') || chatJid.startsWith('fs:');
+          const needsTrigger = !isMainGroup && isGroupChat && group.requiresTrigger !== false;
+
+          logger.debug({ chatJid, groupName: group.name, needsTrigger, isMainGroup, isGroupChat }, 'Processing message group');
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
@@ -386,6 +403,7 @@ async function startMessageLoop(): Promise<void> {
             const hasTrigger = groupMessages.some((m) =>
               TRIGGER_PATTERN.test(m.content.trim()),
             );
+            logger.debug({ chatJid, hasTrigger, messageCount: groupMessages.length, firstMessage: groupMessages[0]?.content.slice(0, 50) }, 'Trigger check');
             if (!hasTrigger) continue;
           }
 
@@ -416,6 +434,7 @@ async function startMessageLoop(): Promise<void> {
               );
           } else {
             // No active container — enqueue for a new one
+            logger.info({ chatJid, groupName: group.name, messageCount: messagesToSend.length }, 'Enqueuing messages for new container');
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -477,6 +496,7 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    registerGroup,
   };
 
   // Create and connect channels
@@ -520,6 +540,14 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendImage: (jid, image) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendImage) {
+        throw new Error(`Channel does not support images: ${channel.name}`);
+      }
+      return channel.sendImage(jid, image);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

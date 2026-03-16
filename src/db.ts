@@ -223,6 +223,16 @@ export function getAllChats(): ChatInfo[] {
 }
 
 /**
+ * Check if a chat is a group chat.
+ */
+export function isGroupChat(chatJid: string): boolean {
+  const row = db
+    .prepare(`SELECT is_group FROM chats WHERE jid = ?`)
+    .get(chatJid) as { is_group: number } | undefined;
+  return row?.is_group === 1;
+}
+
+/**
  * Get timestamp of last group metadata sync.
  */
 export function getLastGroupSync(): string | null {

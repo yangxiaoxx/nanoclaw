@@ -5,18 +5,20 @@ import { CronExpressionParser } from 'cron-parser';
 
 import {
   DATA_DIR,
+  GROUPS_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { OutboundImage, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendImage: (jid: string, image: OutboundImage) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -30,6 +32,131 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+
+function isAuthorizedTarget(
+  sourceGroup: string,
+  isMain: boolean,
+  targetJid: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): boolean {
+  const targetGroup = registeredGroups[targetJid];
+  return isMain || (!!targetGroup && targetGroup.folder === sourceGroup);
+}
+
+function ensureWithinBase(baseDir: string, targetPath: string): boolean {
+  const rel = path.relative(baseDir, targetPath);
+  return !(rel.startsWith('..') || path.isAbsolute(rel));
+}
+
+function expandHomeDir(inputPath: string): string {
+  if (!inputPath.startsWith('~')) return inputPath;
+  const home = process.env.HOME || '';
+  if (!home) return inputPath;
+  if (inputPath === '~') return home;
+  if (inputPath.startsWith('~/')) return path.join(home, inputPath.slice(2));
+  return inputPath;
+}
+
+function resolveExtraMountPath(
+  sourceGroup: string,
+  containerPath: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): string | null {
+  const rel = containerPath.slice('/workspace/extra/'.length);
+  if (!rel) return null;
+
+  const sourceEntry = Object.values(registeredGroups).find(
+    (g) => g.folder === sourceGroup,
+  );
+  const mounts = sourceEntry?.containerConfig?.additionalMounts || [];
+
+  for (const mount of mounts) {
+    const mountAlias =
+      mount.containerPath || path.basename(expandHomeDir(mount.hostPath));
+    if (
+      rel !== mountAlias &&
+      !rel.startsWith(`${mountAlias}/`)
+    ) {
+      continue;
+    }
+
+    const hostBase = path.resolve(expandHomeDir(mount.hostPath));
+    const nested = rel.slice(mountAlias.length).replace(/^\/+/, '');
+    const resolved = nested ? path.resolve(hostBase, nested) : hostBase;
+    if (ensureWithinBase(hostBase, resolved)) {
+      return resolved;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function resolveIpcImagePath(
+  sourceGroup: string,
+  imagePath: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): string | null {
+  const input = imagePath.trim();
+  if (!input) return null;
+
+  const sourceGroupDir = resolveGroupFolderPath(sourceGroup);
+  const globalDir = path.resolve(GROUPS_DIR, 'global');
+
+  if (input.startsWith('/workspace/group')) {
+    const suffix = input.slice('/workspace/group'.length);
+    const resolved = path.resolve(sourceGroupDir, `.${suffix}`);
+    return ensureWithinBase(sourceGroupDir, resolved) ? resolved : null;
+  }
+
+  if (input.startsWith('/workspace/global')) {
+    const suffix = input.slice('/workspace/global'.length);
+    const resolved = path.resolve(globalDir, `.${suffix}`);
+    return ensureWithinBase(globalDir, resolved) ? resolved : null;
+  }
+
+  if (input.startsWith('/workspace/project')) {
+    if (sourceGroup !== MAIN_GROUP_FOLDER) return null;
+    const suffix = input.slice('/workspace/project'.length);
+    const projectRoot = process.cwd();
+    const resolved = path.resolve(projectRoot, `.${suffix}`);
+    return ensureWithinBase(projectRoot, resolved) ? resolved : null;
+  }
+
+  if (input.startsWith('/workspace/extra/')) {
+    return resolveExtraMountPath(sourceGroup, input, registeredGroups);
+  }
+
+  if (input.startsWith('/workspace/ipc/messages/')) {
+    const suffix = input.slice('/workspace/ipc/messages'.length);
+    const ipcMessagesDir = path.resolve(DATA_DIR, 'ipc', sourceGroup, 'messages');
+    const resolved = path.resolve(ipcMessagesDir, `.${suffix}`);
+    return ensureWithinBase(ipcMessagesDir, resolved) ? resolved : null;
+  }
+
+  if (path.isAbsolute(input)) {
+    return null;
+  }
+
+  const resolved = path.resolve(sourceGroupDir, input);
+  return ensureWithinBase(sourceGroupDir, resolved) ? resolved : null;
+}
+
+function cleanupStagedImageIfNeeded(sourceGroup: string, hostPath: string): void {
+  if (!hostPath.includes(`${path.sep}.nanoclaw-ipc-images${path.sep}`)) return;
+
+  const groupDir = resolveGroupFolderPath(sourceGroup);
+  const ipcMessagesDir = path.resolve(DATA_DIR, 'ipc', sourceGroup, 'messages');
+  const inGroup = ensureWithinBase(groupDir, hostPath);
+  const inIpcMessages = ensureWithinBase(ipcMessagesDir, hostPath);
+  if (!inGroup && !inIpcMessages) return;
+
+  try {
+    fs.unlinkSync(hostPath);
+  } catch (err) {
+    logger.debug({ sourceGroup, hostPath, err }, 'Failed to delete staged image');
+  }
+}
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -72,24 +199,79 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
+              const chatJid =
+                typeof data.chatJid === 'string' ? data.chatJid : '';
+
+              if (!chatJid) {
+                logger.warn({ sourceGroup, file }, 'IPC message missing chatJid');
+              } else if (
+                !isAuthorizedTarget(
+                  sourceGroup,
+                  isMain,
+                  chatJid,
+                  registeredGroups,
+                )
+              ) {
+                logger.warn(
+                  { chatJid, sourceGroup },
+                  'Unauthorized IPC message attempt blocked',
+                );
+              } else if (
+                data.type === 'message' &&
+                typeof data.text === 'string' &&
+                data.text.trim().length > 0
+              ) {
+                await deps.sendMessage(chatJid, data.text);
+                logger.info({ chatJid, sourceGroup }, 'IPC message sent');
+              } else if (data.type === 'image') {
+                const imagePath =
+                  typeof data.imagePath === 'string' ? data.imagePath.trim() : '';
+                const imageUrl =
+                  typeof data.imageUrl === 'string' ? data.imageUrl.trim() : '';
+                const hasPath = imagePath.length > 0;
+                const hasUrl = imageUrl.length > 0;
+                const caption =
+                  typeof data.caption === 'string' ? data.caption : undefined;
+
+                if ((hasPath ? 1 : 0) + (hasUrl ? 1 : 0) !== 1) {
                   logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
+                    { chatJid, sourceGroup, file },
+                    'Invalid IPC image payload: must include exactly one of imagePath or imageUrl',
+                  );
+                } else if (hasPath) {
+                  const hostPath = resolveIpcImagePath(
+                    sourceGroup,
+                    imagePath,
+                    registeredGroups,
+                  );
+                  if (!hostPath) {
+                    logger.warn(
+                      { chatJid, sourceGroup, imagePath },
+                      'IPC image path rejected or not resolvable',
+                    );
+                  } else {
+                    try {
+                      await deps.sendImage(chatJid, { path: hostPath, caption });
+                      logger.info(
+                        { chatJid, sourceGroup, imagePath: hostPath },
+                        'IPC image sent',
+                      );
+                    } finally {
+                      cleanupStagedImageIfNeeded(sourceGroup, hostPath);
+                    }
+                  }
+                } else {
+                  await deps.sendImage(chatJid, { url: imageUrl, caption });
+                  logger.info(
+                    { chatJid, sourceGroup, imageUrl },
+                    'IPC image sent',
                   );
                 }
+              } else {
+                logger.warn(
+                  { sourceGroup, file, type: data.type },
+                  'Unknown IPC message type',
+                );
               }
               fs.unlinkSync(filePath);
             } catch (err) {

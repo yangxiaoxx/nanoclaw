@@ -34,6 +34,64 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+function isHostResolvableContainerPath(p: string): boolean {
+  return (
+    p.startsWith('/workspace/group/') ||
+    p === '/workspace/group' ||
+    p.startsWith('/workspace/global/') ||
+    p === '/workspace/global' ||
+    p.startsWith('/workspace/project/') ||
+    p === '/workspace/project' ||
+    p.startsWith('/workspace/extra/') ||
+    p.startsWith('/workspace/ipc/messages/')
+  );
+}
+
+function stageImagePathForHost(rawPath: string): string {
+  const resolved = path.isAbsolute(rawPath)
+    ? path.resolve(rawPath)
+    : path.resolve('/workspace/group', rawPath);
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Image path does not exist: ${rawPath}`);
+  }
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`Image path is not a file: ${rawPath}`);
+  }
+
+  if (isHostResolvableContainerPath(resolved)) {
+    return resolved;
+  }
+
+  // Files under container-only locations like /tmp are not visible to host IPC.
+  // Stage a copy into a host-resolvable writable mount.
+  const ext = path.extname(resolved);
+  const stagedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+  const candidates = [
+    '/workspace/group/.nanoclaw-ipc-images',
+    '/workspace/ipc/messages/.nanoclaw-ipc-images',
+  ];
+
+  const failures: string[] = [];
+  for (const stagedDir of candidates) {
+    try {
+      fs.mkdirSync(stagedDir, { recursive: true });
+      const stagedPath = path.join(stagedDir, stagedName);
+      fs.copyFileSync(resolved, stagedPath);
+      return stagedPath;
+    } catch (err) {
+      failures.push(
+        `${stagedDir}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  throw new Error(
+    `Failed to stage image to host-resolvable path. ${failures.join(' | ')}`,
+  );
+}
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
@@ -59,6 +117,70 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_image',
+  "Send an image to the current chat immediately. Provide either a local file path (inside the container, e.g. /workspace/group/image.png) or a URL.",
+  {
+    path: z
+      .string()
+      .optional()
+      .describe('Local file path inside the container (e.g. /workspace/group/image.png)'),
+    url: z
+      .string()
+      .optional()
+      .describe('Public image URL (http/https)'),
+    caption: z
+      .string()
+      .optional()
+      .describe('Optional caption sent after the image'),
+  },
+  async (args) => {
+    const hasPath = typeof args.path === 'string' && args.path.trim().length > 0;
+    const hasUrl = typeof args.url === 'string' && args.url.trim().length > 0;
+    if ((hasPath ? 1 : 0) + (hasUrl ? 1 : 0) !== 1) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'send_image requires exactly one of "path" or "url".',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let imagePath: string | undefined;
+    if (hasPath) {
+      try {
+        imagePath = stageImagePathForHost(args.path!.trim());
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid image path: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'image',
+      chatJid,
+      imagePath,
+      imageUrl: hasUrl ? args.url!.trim() : undefined,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+    return { content: [{ type: 'text' as const, text: 'Image send requested.' }] };
   },
 );
 

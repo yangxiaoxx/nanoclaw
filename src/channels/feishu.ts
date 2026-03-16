@@ -1,9 +1,13 @@
 import * as lark from '@larksuiteoapi/node-sdk';
+import fs from 'fs';
+import path from 'path';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import {
   Channel,
+  OutboundImage,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -13,6 +17,7 @@ export interface FeishuChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  registerGroup: (jid: string, group: RegisteredGroup) => void;
 }
 
 interface FeishuMention {
@@ -21,6 +26,10 @@ interface FeishuMention {
   name: string;
   tenant_key?: string;
 }
+
+const FEISHU_MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10MB
+const FEISHU_IMAGE_FETCH_TIMEOUT_MS = 20_000;
+const FEISHU_MENTION_IMAGE_GRACE_MS = 60_000;
 
 export class FeishuChannel implements Channel {
   name = 'feishu';
@@ -35,6 +44,7 @@ export class FeishuChannel implements Channel {
   private botOpenId = '';
   private userNameCache = new Map<string, string>();
   private chatNameCache = new Map<string, string>();
+  private recentMentions = new Map<string, number>();
 
   constructor(
     appId: string,
@@ -192,6 +202,144 @@ export class FeishuChannel implements Channel {
     );
   }
 
+  private parseMessageContent(content: string): Record<string, unknown> {
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Fall through to empty object
+    }
+    return {};
+  }
+
+  private safeImageExtension(headers: any): string {
+    const contentType = String(headers?.['content-type'] || '')
+      .split(';')[0]
+      .trim()
+      .toLowerCase();
+    if (contentType === 'image/jpeg') return '.jpg';
+    if (contentType === 'image/png') return '.png';
+    if (contentType === 'image/webp') return '.webp';
+    if (contentType === 'image/gif') return '.gif';
+    if (contentType === 'image/bmp') return '.bmp';
+    if (contentType === 'image/tiff') return '.tiff';
+    if (contentType === 'image/x-icon' || contentType === 'image/vnd.microsoft.icon')
+      return '.ico';
+    return '.img';
+  }
+
+  private async buildInboundImageContent(
+    groupFolder: string,
+    messageId: string,
+    timestamp: string,
+    rawContent: string,
+  ): Promise<string> {
+    if (!this.client) {
+      return '[Feishu image] (client unavailable for download)';
+    }
+
+    const parsed = this.parseMessageContent(rawContent);
+    const imageKey = String(parsed.image_key || parsed.file_key || '').trim();
+    if (!imageKey) {
+      logger.warn({ messageId }, 'Feishu image message missing image_key');
+      return '[Feishu image]';
+    }
+
+    try {
+      const imageResp = await this.client.im.messageResource.get({
+        params: { type: 'image' },
+        path: { message_id: messageId, file_key: imageKey },
+      });
+
+      const inboxDir = path.join(
+        resolveGroupFolderPath(groupFolder),
+        'inbox',
+        'feishu',
+      );
+      await fs.promises.mkdir(inboxDir, { recursive: true });
+
+      const safeMessageId = messageId.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const safeImageKey = imageKey.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const safeTimestamp = timestamp.replace(/[:.]/g, '-');
+      const extension = this.safeImageExtension(imageResp.headers);
+      const fileName = `${safeTimestamp}-${safeMessageId}-${safeImageKey.slice(-12)}${extension}`;
+      const hostPath = path.join(inboxDir, fileName);
+      await imageResp.writeFile(hostPath);
+
+      const containerPath = path.join('/workspace/group', 'inbox', 'feishu', fileName);
+      return `[Feishu image] ${containerPath}`;
+    } catch (err: any) {
+      logger.error(
+        { err: err?.message, messageId, imageKey },
+        'Failed to download inbound Feishu image',
+      );
+      return '[Feishu image] (download failed)';
+    }
+  }
+
+  private async readImageBufferFromPath(filePath: string): Promise<Buffer> {
+    const stats = await fs.promises.stat(filePath);
+    if (!stats.isFile()) {
+      throw new Error(`Image path is not a file: ${filePath}`);
+    }
+    if (stats.size <= 0) {
+      throw new Error(`Image file is empty: ${filePath}`);
+    }
+    if (stats.size > FEISHU_MAX_IMAGE_BYTES) {
+      throw new Error(
+        `Image file exceeds Feishu limit (${FEISHU_MAX_IMAGE_BYTES} bytes): ${filePath}`,
+      );
+    }
+    return fs.promises.readFile(filePath);
+  }
+
+  private async readImageBufferFromUrl(url: string): Promise<Buffer> {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`Invalid image URL: ${url}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Unsupported URL protocol: ${parsed.protocol}`);
+    }
+
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(FEISHU_IMAGE_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      throw new Error(`Image URL request failed: ${resp.status} ${resp.statusText}`);
+    }
+
+    const contentLength = Number(resp.headers.get('content-length') || '0');
+    if (contentLength > FEISHU_MAX_IMAGE_BYTES) {
+      throw new Error(
+        `Image URL exceeds Feishu limit (${FEISHU_MAX_IMAGE_BYTES} bytes)`,
+      );
+    }
+
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    if (buffer.length <= 0) {
+      throw new Error('Image URL returned empty content');
+    }
+    if (buffer.length > FEISHU_MAX_IMAGE_BYTES) {
+      throw new Error(
+        `Image URL payload exceeds Feishu limit (${FEISHU_MAX_IMAGE_BYTES} bytes)`,
+      );
+    }
+    return buffer;
+  }
+
+  private pruneRecentMentions(nowMs: number): void {
+    for (const [key, ts] of this.recentMentions.entries()) {
+      if (nowMs - ts > FEISHU_MENTION_IMAGE_GRACE_MS) {
+        this.recentMentions.delete(key);
+      }
+    }
+  }
+
   private async handleMessage(data: {
     sender: {
       sender_id?: {
@@ -217,42 +365,20 @@ export class FeishuChannel implements Channel {
     // Skip messages from bots (including ourselves)
     if (sender.sender_type === 'app') return;
 
-    // Only handle text messages for now
-    if (message.message_type !== 'text') {
-      logger.debug(
-        { type: message.message_type },
-        'Skipping non-text Feishu message',
-      );
-      return;
-    }
-
     const chatId = message.chat_id;
     const chatJid = `fs:${chatId}`;
     const messageId = message.message_id;
     const senderOpenId = sender.sender_id?.open_id || '';
+    const messageTsMs = parseInt(message.create_time, 10);
+    this.pruneRecentMentions(messageTsMs);
     const timestamp = new Date(
-      parseInt(message.create_time),
+      messageTsMs,
     ).toISOString();
     const isGroup = message.chat_type === 'group';
+    const parsedContent = this.parseMessageContent(message.content);
+    const mentionKey = `${chatJid}:${senderOpenId}`;
 
-    // Parse message content
-    let content = '';
-    try {
-      const msgContent = JSON.parse(message.content);
-      content = msgContent.text || '';
-    } catch {
-      content = message.content || '';
-    }
-
-    // Resolve mentions: replace placeholders with real names, detect bot @mention
-    let botMentioned = false;
-    if (message.mentions && message.mentions.length > 0) {
-      const result = this.resolveMentions(content, message.mentions);
-      content = result.text;
-      botMentioned = result.botMentioned;
-    }
-
-    // Resolve sender name and chat name in parallel
+    // Resolve sender name and chat name in parallel so metadata always gets a friendly name.
     const [senderName, chatName] = await Promise.all([
       this.resolveUserName(senderOpenId),
       this.resolveChatName(chatId),
@@ -261,19 +387,70 @@ export class FeishuChannel implements Channel {
     // Store chat metadata with resolved chat name
     this.opts.onChatMetadata(chatJid, timestamp, chatName, 'feishu', isGroup);
 
-    // Check if registered
-    const group = this.opts.registeredGroups()[chatJid];
+    // Check if registered, auto-register all Feishu chats
+    let group = this.opts.registeredGroups()[chatJid];
     if (!group) {
-      logger.info(
-        { chatJid, chatName },
-        'Message from unregistered Feishu chat',
-      );
-      return;
+      const prefix = isGroup ? 'feishu-group' : 'feishu-dm';
+      const folder = `${prefix}-${chatId.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      group = {
+        name: chatName || chatJid,
+        folder,
+        trigger: `@${ASSISTANT_NAME}`,
+        added_at: timestamp,
+        requiresTrigger: !isGroup ? false : true,
+      };
+      logger.info({ chatJid, chatName, folder, isGroup }, 'Auto-registering Feishu chat');
+      this.opts.registerGroup(chatJid, group);
+      this.opts.onChatMetadata(chatJid, timestamp, chatName || chatJid, 'feishu', isGroup);
     }
 
-    // If bot was @mentioned in a group, ensure trigger pattern is present
-    if (isGroup && botMentioned && !TRIGGER_PATTERN.test(content)) {
-      content = `@${ASSISTANT_NAME} ${content}`;
+    let content = '';
+    if (message.message_type === 'text') {
+      content =
+        typeof parsedContent.text === 'string'
+          ? parsedContent.text
+          : message.content || '';
+
+      let botMentioned = false;
+      if (message.mentions && message.mentions.length > 0) {
+        const result = this.resolveMentions(content, message.mentions);
+        content = result.text;
+        botMentioned = result.botMentioned;
+      }
+
+      // If bot was @mentioned in a group, ensure trigger pattern is present.
+      if (isGroup && botMentioned && !TRIGGER_PATTERN.test(content)) {
+        content = `@${ASSISTANT_NAME} ${content}`;
+      }
+
+      if (isGroup && botMentioned) {
+        this.recentMentions.set(mentionKey, messageTsMs);
+      }
+    } else if (message.message_type === 'image') {
+      content = await this.buildInboundImageContent(
+        group.folder,
+        messageId,
+        timestamp,
+        message.content,
+      );
+      // Feishu cannot mix @mention and image in one message, so allow a short
+      // grace window where an image right after an @mention is treated as triggered.
+      const lastMentionAt = this.recentMentions.get(mentionKey);
+      if (
+        isGroup &&
+        lastMentionAt &&
+        messageTsMs >= lastMentionAt &&
+        messageTsMs - lastMentionAt <= FEISHU_MENTION_IMAGE_GRACE_MS &&
+        !TRIGGER_PATTERN.test(content)
+      ) {
+        content = `@${ASSISTANT_NAME} ${content}`;
+      }
+    } else {
+      logger.debug(
+        { type: message.message_type, chatJid },
+        'Skipping unsupported Feishu message type',
+      );
+      return;
     }
 
     // Deliver message
@@ -317,6 +494,71 @@ export class FeishuChannel implements Channel {
       logger.error(
         { err: err.message, jid },
         'Failed to send Feishu message',
+      );
+      throw err;
+    }
+  }
+
+  async sendImage(jid: string, image: OutboundImage): Promise<void> {
+    if (!this.client) {
+      throw new Error('Feishu client not connected');
+    }
+
+    const hasPath = typeof image.path === 'string' && image.path.trim().length > 0;
+    const hasUrl = typeof image.url === 'string' && image.url.trim().length > 0;
+    if ((hasPath ? 1 : 0) + (hasUrl ? 1 : 0) !== 1) {
+      throw new Error('sendImage requires exactly one of path or url');
+    }
+
+    const chatId = jid.replace('fs:', '');
+    const imageSource = hasPath ? image.path!.trim() : image.url!.trim();
+
+    try {
+      const imageBuffer = hasPath
+        ? await this.readImageBufferFromPath(imageSource)
+        : await this.readImageBufferFromUrl(imageSource);
+
+      const uploadResp = await this.client.im.image.create({
+        data: {
+          image_type: 'message',
+          image: imageBuffer,
+        },
+      });
+      const imageKey = uploadResp?.image_key;
+      if (!imageKey) {
+        throw new Error('Feishu image upload did not return image_key');
+      }
+
+      await this.client.im.message.create({
+        params: {
+          receive_id_type: 'chat_id',
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
+        },
+      });
+
+      const caption = typeof image.caption === 'string' ? image.caption.trim() : '';
+      if (caption) {
+        await this.sendMessage(jid, caption);
+      }
+
+      logger.info(
+        {
+          jid,
+          hasPath,
+          hasUrl,
+          imageBytes: imageBuffer.length,
+          hasCaption: !!caption,
+        },
+        'Feishu image sent',
+      );
+    } catch (err: any) {
+      logger.error(
+        { err: err?.message, jid, imageSource },
+        'Failed to send Feishu image',
       );
       throw err;
     }

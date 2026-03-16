@@ -58,13 +58,16 @@ export class GroupQueue {
   }
 
   enqueueMessageCheck(groupJid: string): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown) {
+      logger.info({ groupJid }, 'Queue shutting down, ignoring enqueue');
+      return;
+    }
 
     const state = this.getGroup(groupJid);
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      logger.info({ groupJid }, 'Container active, message queued');
       return;
     }
 
@@ -73,13 +76,14 @@ export class GroupQueue {
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
       }
-      logger.debug(
-        { groupJid, activeCount: this.activeCount },
+      logger.info(
+        { groupJid, activeCount: this.activeCount, maxConcurrent: MAX_CONCURRENT_CONTAINERS },
         'At concurrency limit, message queued',
       );
       return;
     }
 
+    logger.info({ groupJid, activeCount: this.activeCount }, 'Starting new container for messages');
     this.runForGroup(groupJid, 'messages').catch((err) =>
       logger.error({ groupJid, err }, 'Unhandled error in runForGroup'),
     );
@@ -198,13 +202,14 @@ export class GroupQueue {
     state.pendingMessages = false;
     this.activeCount++;
 
-    logger.debug(
+    logger.info(
       { groupJid, reason, activeCount: this.activeCount },
-      'Starting container for group',
+      'runForGroup: Starting container for group',
     );
 
     try {
       if (this.processMessagesFn) {
+        logger.info({ groupJid }, 'runForGroup: Calling processMessagesFn');
         const success = await this.processMessagesFn(groupJid);
         if (success) {
           state.retryCount = 0;
